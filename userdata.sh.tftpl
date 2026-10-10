@@ -1,0 +1,153 @@
+#!/bin/bash
+set -euo pipefail
+
+# Output log to system log for debugging launch template issues
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+echo "[+] Starting WordPress Launch Template User Data script..."
+
+# ==========================================
+# CONFIGURATION VARIABLES
+# ==========================================
+DB_NAME="wordpress_prod"
+DB_USER="wp_user"
+DB_PASSWORD="YOUR_RDS_SECURE_PASSWORD"
+DB_HOST="your-rds-endpoint.xxxxxx.us-east-1.rds.amazonaws.com"
+EFS_ID="" # Optional: EFS File System ID for shared wp-content (e.g., "fs-0123456789abcdef0")
+
+# ==========================================
+# 1. SYSTEM UPDATES & DEPENDENCY INSTALLS
+# Designed for Ubuntu 22.04 / 24.04 LTS
+# ==========================================
+export DEBIAN_FRONTEND=noninteractive
+apt-get update && apt-get upgrade -y
+apt-get install -y \
+    nginx \
+    php-fpm \
+    php-mysql \
+    php-cli \
+    php-curl \
+    php-gd \
+    php-mbstring \
+    php-xml \
+    php-xmlrpc \
+    php-soap \
+    php-intl \
+    php-zip \
+    amazon-efs-utils \
+    awscli \
+    unzip
+
+# Detect active PHP version dynamically
+PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+
+# ==========================================
+# 2. CONFIGURE NGINX WEB SERVER
+# ==========================================
+cat << 'EOF' > /etc/nginx/sites-available/wordpress
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    root /var/www/html;
+    index index.php index.html index.htm;
+    server_name _;
+
+    client_max_body_size 64M;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg)$ {
+        expires max;
+        log_not_found off;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+
+# Activate configuration & apply dynamic PHP socket version
+ln -sf /etc/nginx/sites-available/wordpress /etc/nginx/sites-enabled/default
+sed -i "s|fastcgi_pass unix:/run/php/php-fpm.sock;|fastcgi_pass unix:/run/php/php${PHP_VER}-fpm.sock;|g" /etc/nginx/sites-available/wordpress
+
+# ==========================================
+# 3. MOUNT AWS EFS (FOR SHARED UPLOADS)
+# ==========================================
+if [ -n "$EFS_ID" ]; then
+    echo "[+] Mounting EFS volume for wp-content/uploads..."
+    mkdir -p /var/www/html/wp-content/uploads
+    mount -t efs -o tls ${EFS_ID}:/ /var/www/html/wp-content/uploads
+    echo "${EFS_ID}:/ /var/www/html/wp-content/uploads efs _netdev,tls 0 0" >> /etc/fstab
+fi
+
+# ==========================================
+# 4. DOWNLOAD & CONFIGURE WORDPRESS
+# ==========================================
+if [ ! -f /var/www/html/wp-config.php ]; then
+    echo "[+] Installing WordPress core..."
+    cd /tmp
+    curl -O https://wordpress.org/latest.tar.gz
+    tar -xzf latest.tar.gz
+    cp -a /tmp/wordpress/. /var/www/html/
+
+    # Create wp-config.php
+    cp /var/www/html/wp-config-sample.php /var/www/html/wp-config.php
+
+    # Apply database settings
+    sed -i "s/database_name_here/${DB_NAME}/g" /var/www/html/wp-config.php
+    sed -i "s/username_here/${DB_USER}/g" /var/www/html/wp-config.php
+    sed -i "s/password_here/${DB_PASSWORD}/g" /var/www/html/wp-config.php
+    sed -i "s/localhost/${DB_HOST}/g" /var/www/html/wp-config.php
+
+    # Inject security keys / salts dynamically
+    SALTS=$(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+    python3 -c "
+import re
+salts = '''$SALTS'''
+with open('/var/www/html/wp-config.php', 'r') as f:
+    content = f.read()
+pattern = r\"define\('AUTH_KEY'.*?define\('NONCE_SALT'.*?\);\"
+content = re.sub(pattern, salts, content, flags=re.DOTALL)
+with open('/var/www/html/wp-config.php', 'w') as f:
+    f.write(content)
+"
+
+    # Append AWS ALB SSL and production hardening settings
+    cat << 'EOF' >> /var/www/html/wp-config.php
+
+/* Production Hardening */
+define('DISALLOW_FILE_EDIT', true);
+define('FORCE_SSL_ADMIN', true);
+define('WP_AUTO_UPDATE_CORE', 'minor');
+
+/* Handle AWS Application Load Balancer SSL termination */
+if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'HTTPS') {
+    $_SERVER['HTTPS'] = 'on';
+}
+EOF
+fi
+
+# ==========================================
+# 5. PERMISSIONS & SERVICE INITIALIZATION
+# ==========================================
+chown -R www-data:www-data /var/www/html
+find /var/www/html/ -type d -exec chmod 755 {} \;
+find /var/www/html/ -type f -exec chmod 644 {} \;
+
+systemctl restart php${PHP_VER}-fpm
+systemctl restart nginx
+systemctl enable nginx php${PHP_VER}-fpm
+
+echo "[+] WordPress User Data initialization complete!"
+
+## > templatefile("${path.module}/backends.tftpl", { port = 8080, ip_addrs = ["10.0.0.1", "10.0.0.2"] })

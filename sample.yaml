@@ -1,0 +1,113 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template generated from AWS CLI commands - Creates security group and EC2 instance'
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID for the security group
+    Default: vpc-0b3a4a8f37880b519
+
+  ImageId:
+    Type: String
+    Description: AMI ID for the EC2 instance
+    Default: ami-0d27e0fb3bac4d724
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+Resources:
+  # Security Group - launch-wizard-3
+  # Created from: aws ec2 create-security-group
+  LaunchWizard3SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: launch-wizard-3
+      GroupDescription: launch-wizard-3 created 2026-10-10T01:20:14.707Z
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: launch-wizard-3
+
+  # Security Group Ingress Rule for SSH access
+  # Created from: aws ec2 authorize-security-group-ingress
+  # Note: This rule references sg-preview-1 which should be created separately or replaced with LaunchWizard3SecurityGroup
+  SecurityGroupIngressSSH:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: sg-preview-1  # Replace with !Ref LaunchWizard3SecurityGroup if this is the intended security group
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: 0.0.0.0/0
+      Description: Allow SSH access from anywhere
+
+  # EC2 Instance - test-instance-provisioning
+  # Created from: aws ec2 run-instances
+  TestInstanceProvisioning:
+    Type: AWS::EC2::Instance
+    Properties:
+      # AMI and instance configuration
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      EbsOptimized: true
+      
+      # Network configuration
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - sg-preview-1  # Replace with !Ref LaunchWizard3SecurityGroup if this is the intended security group
+          DeleteOnTermination: true
+      
+      # Credit specification for T3 instance
+      CreditSpecification:
+        CPUCredits: unlimited
+      
+      # Metadata options for IMDSv2
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 2
+        HttpTokens: required  # Enforces IMDSv2
+      
+      # Private DNS name options
+      PrivateDnsNameOptions:
+        HostnameType: ip-name
+        EnableResourceNameDnsARecord: true
+        EnableResourceNameDnsAAAARecord: false
+      
+      # Tags
+      Tags:
+        - Key: Name
+          Value: test-instance-provisioning
+
+Outputs:
+  SecurityGroupId:
+    Description: Security Group ID for launch-wizard-3
+    Value: !Ref LaunchWizard3SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+
+  InstanceId:
+    Description: Instance ID of the EC2 instance
+    Value: !Ref TestInstanceProvisioning
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+
+  InstancePublicIp:
+    Description: Public IP address of the EC2 instance
+    Value: !GetAtt TestInstanceProvisioning.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicIp'
+
+  InstancePrivateIp:
+    Description: Private IP address of the EC2 instance
+    Value: !GetAtt TestInstanceProvisioning.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIp'
